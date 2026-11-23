@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Deteksi Tangan</title>
+<style>
+  :root {
+    --bg: #101418;
+    --panel: #1a2026;
+    --fg: #eef2f5;
+    --muted: #8d9aa6;
+    --accent: #3ddc97;
+    --warn: #ffb454;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 640px; margin: 0 auto;
+    padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right))
+             max(16px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+    display: flex; flex-direction: column; gap: 12px; }
+  h1 { font-size: 1.15rem; margin: 4px 0 0; }
+  .stage { position: relative; width: 100%; aspect-ratio: 3 / 4; background: #000;
+    border-radius: 14px; overflow: hidden; }
+  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .mirror { transform: scaleX(-1); }
+  #msg { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px;
+    text-align: center; color: var(--muted); }
+  .row { display: flex; gap: 8px; }
+  button { flex: 1; font: inherit; font-weight: 600; padding: 14px; border: 0; border-radius: 12px;
+    background: var(--accent); color: #06231a; }
+  button.secondary { background: var(--panel); color: var(--fg); }
+  button:disabled { opacity: .5; }
+  .panel { background: var(--panel); border-radius: 12px; padding: 12px 14px;
+    display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; }
+  .panel .k { color: var(--muted); }
+  .panel .v { font-variant-numeric: tabular-nums; font-weight: 600; text-align: right; }
+  .big { font-size: 2rem; color: var(--accent); }
+  .note { color: var(--muted); font-size: .85rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Deteksi Tangan</h1>
+
+  <div class="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="canvas"></canvas>
+    <div id="msg">Tekan "Mulai Kamera" untuk memulai.</div>
+  </div>
+
+  <div class="row">
+    <button id="start">Mulai Kamera</button>
+    <button id="flip" class="secondary" disabled>Balik Kamera</button>
+  </div>
+
+  <div class="panel">
+    <span class="k">Total jari terangkat</span><span class="v big" id="total">0</span>
+    <span class="k">Tangan terdeteksi</span><span class="v" id="hands">0</span>
+    <span class="k">Detail</span><span class="v" id="detail">-</span>
+    <span class="k">FPS</span><span class="v" id="fps">0</span>
+  </div>
+
+  <p class="note">Semua proses berjalan di perangkatmu. Video tidak dikirim ke mana pun.</p>
+</main>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver, DrawingUtils }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const WASM  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+const $ = (id) => document.getElementById(id);
+const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
+const msg = $("msg"), startBtn = $("start"), flipBtn = $("flip");
+const drawing = new DrawingUtils(ctx);
+
+let landmarker = null, stream = null, facing = "user", running = false;
+let lastVideoTime = -1, lastFrame = performance.now(), fpsSmooth = 0;
+
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+// Hitung jari terangkat. Berbasis jarak, jadi tidak bergantung arah/rotasi tangan.
+function hitungJari(lm) {
+  let n = 0;
+  // Jempol: ujung (4) lebih jauh dari pangkal kelingking (17) dibanding sendi (3)
+  if (dist(lm[4], lm[17]) > dist(lm[3], lm[17]) * 1.1) n++;
+  // 4 jari lain: ujung lebih jauh dari pergelangan (0) dibanding sendi PIP
+  for (const [tip, pip] of [[8, 6], [12, 10], [16, 14], [20, 18]]) {
+    if (dist(lm[tip], lm[0]) > dist(lm[pip], lm[0]) * 1.05) n++;
+  }
+  return n;
+}
+
+async function loadModel() {
+  msg.textContent = "Memuat model deteksi...";
+  const fileset = await FilesetResolver.forVisionTasks(WASM);
+  const opts = (delegate) => ({
+    baseOptions: { modelAssetPath: MODEL, delegate },
+    runningMode: "VIDEO",
+    numHands: 2,
+    minHandDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.5,
+  });
+  try {
+    landmarker = await HandLandmarker.createFromOptions(fileset, opts("GPU"));
+  } catch (e) {
+    landmarker = await HandLandmarker.createFromOptions(fileset, opts("CPU"));
+  }
+}
+
+async function openCamera() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } },
+  });
+  video.srcObject = stream;
+  await video.play();
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const mirror = facing === "user";
+  video.classList.toggle("mirror", mirror);
+  canvas.classList.toggle("mirror", mirror);
+  msg.hidden = true;
+}
+
+function loop() {
+  if (!running) return;
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    let total = 0;
+    const detail = [];
+    for (const lm of res.landmarks) {
+      drawing.drawConnectors(lm, HandLandmarker.HAND_CONNECTIONS,
+        { color: "#3ddc97", lineWidth: 3 });
+      drawing.drawLandmarks(lm, { color: "#ffffff", fillColor: "#ff5d73", radius: 3 });
+      const n = hitungJari(lm);
+      total += n;
+      detail.push(n);
+    }
+    $("total").textContent = total;
+    $("hands").textContent = res.landmarks.length;
+    $("detail").textContent = detail.length ? detail.join(" + ") : "-";
+
+    const now = performance.now();
+    const inst = 1000 / (now - lastFrame);
+    fpsSmooth = fpsSmooth ? fpsSmooth * 0.9 + inst * 0.1 : inst;
+    lastFrame = now;
+    $("fps").textContent = Math.round(fpsSmooth);
+  }
+  requestAnimationFrame(loop);
+}
+
+startBtn.addEventListener("click", async () => {
+  startBtn.disabled = true;
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error("Kamera butuh koneksi HTTPS. Buka halaman ini lewat alamat https://");
+    }
+    if (!landmarker) await loadModel();
+    await openCamera();
+    running = true;
+    flipBtn.disabled = false;
+    startBtn.textContent = "Kamera Aktif";
+    loop();
+  } catch (e) {
+    msg.hidden = false;
+    msg.textContent = "Gagal: " + (e.message || e);
+    startBtn.disabled = false;
+  }
+});
+
+flipBtn.addEventListener("click", async () => {
+  facing = facing === "user" ? "environment" : "user";
+  try { await openCamera(); } catch (e) { msg.hidden = false; msg.textContent = "Gagal: " + e.message; }
+});
+</script>
+</body>
+</html>
